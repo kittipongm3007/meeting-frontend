@@ -50,118 +50,157 @@ export default function useWebRTC(socket, roomId) {
 
         // add local tracks to all existing PCs (avoid duplicates by kind)
         peersRef.current.forEach(({ pc }) => {
-            const sendKinds = pc.getSenders()
+            const sendKinds = pc
+                .getSenders()
                 .map((s) => s.track && s.track.kind)
                 .filter(Boolean);
             stream.getTracks().forEach((t) => {
                 if (!sendKinds.includes(t.kind)) {
-                    try { pc.addTrack(t, stream); } catch (e) { console.warn("addTrack error", e); }
+                    try {
+                        pc.addTrack(t, stream);
+                    } catch (e) {
+                        console.warn("addTrack error", e);
+                    }
                 }
             });
         });
     }, []);
 
     // ----- Single-flight negotiation helper (Set A) -----
-    const negotiate = useCallback(async (id, pc, st) => {
-        if (st.negotiating) { st.needNegotiation = true; return; }
-        st.negotiating = true;
-        try {
-            // negotiate only from stable to avoid ping-pong
-            if (pc.signalingState !== "stable") return;
-
-            st.makingOffer = true;
-            const offer = await pc.createOffer();
-            // if state changed while creating the offer, abort this round
-            if (pc.signalingState !== "stable") return;
-
-            await pc.setLocalDescription(offer);
-            socket.emit("meeting:offer", { roomId, to: id, sdp: pc.localDescription });
-        } catch (err) {
-            console.warn("[negotiate] error", err);
-        } finally {
-            st.makingOffer = false;
-            st.negotiating = false;
-            if (st.needNegotiation) {
-                st.needNegotiation = false;
-                // schedule the next round
-                negotiate(id, pc, st);
+    const negotiate = useCallback(
+        async (id, pc, st) => {
+            if (st.negotiating) {
+                st.needNegotiation = true;
+                return;
             }
-        }
-    }, [roomId, socket]);
+            st.negotiating = true;
+            try {
+                // negotiate only from stable to avoid ping-pong
+                if (pc.signalingState !== "stable") return;
 
-    const addPeer = useCallback((id) => {
-        if (!id) return null;
-        if (id === selfIdRef.current) return null; // don't create a peer to self
-        if (peersRef.current.has(id)) return peersRef.current.get(id);
-        if (peersRef.current.size >= MAX_PEERS) {
-            console.warn("[webrtc] reached MAX_PEERS, ignore", id);
-            return null;
-        }
+                st.makingOffer = true;
+                const offer = await pc.createOffer();
+                // if state changed while creating the offer, abort this round
+                if (pc.signalingState !== "stable") return;
 
-        const pc = createPeerConnection({ iceServers });
-        const st = makePeerState();
+                await pc.setLocalDescription(offer);
+                socket.emit("meeting:offer", {
+                    roomId,
+                    to: id,
+                    sdp: pc.localDescription,
+                });
+            } catch (err) {
+                console.warn("[negotiate] error", err);
+            } finally {
+                st.makingOffer = false;
+                st.negotiating = false;
+                if (st.needNegotiation) {
+                    st.needNegotiation = false;
+                    // schedule the next round
+                    negotiate(id, pc, st);
+                }
+            }
+        },
+        [roomId, socket]
+    );
 
-        // OPTIONAL (helps some browsers begin receiving even before tracks are added on remote)
-        // pc.addTransceiver("video", { direction: "recvonly" });
-        // pc.addTransceiver("audio", { direction: "recvonly" });
+    const addPeer = useCallback(
+        (id) => {
+            if (!id) return null;
+            if (id === selfIdRef.current) return null; // don't create a peer to self
+            if (peersRef.current.has(id)) return peersRef.current.get(id);
+            if (peersRef.current.size >= MAX_PEERS) {
+                console.warn("[webrtc] reached MAX_PEERS, ignore", id);
+                return null;
+            }
 
-        // add local tracks if available
-        if (localStreamRef.current) {
-            const sendKinds = pc.getSenders()
-                .map((s) => s.track && s.track.kind)
-                .filter(Boolean);
-            localStreamRef.current.getTracks().forEach((t) => {
-                if (!sendKinds.includes(t.kind)) {
-                    try { pc.addTrack(t, localStreamRef.current); } catch (e) { console.warn("addTrack error", e); }
+            const pc = createPeerConnection({ iceServers });
+            const st = makePeerState();
+
+            // OPTIONAL (helps some browsers begin receiving even before tracks are added on remote)
+            // pc.addTransceiver("video", { direction: "recvonly" });
+            // pc.addTransceiver("audio", { direction: "recvonly" });
+
+            // add local tracks if available
+            if (localStreamRef.current) {
+                const sendKinds = pc
+                    .getSenders()
+                    .map((s) => s.track && s.track.kind)
+                    .filter(Boolean);
+                localStreamRef.current.getTracks().forEach((t) => {
+                    if (!sendKinds.includes(t.kind)) {
+                        try {
+                            pc.addTrack(t, localStreamRef.current);
+                        } catch (e) {
+                            console.warn("addTrack error", e);
+                        }
+                    }
+                });
+            }
+
+            // remote media
+            pc.ontrack = (e) => {
+                console.log("[ontrack]", id, e.streams);
+
+                const incoming = e.streams[0];
+                const p = peersRef.current.get(id);
+                if (p) {
+                    p.stream = incoming;
+                    refresh();
+                }
+            };
+
+            // ICE → signal to the other peer
+            pc.onicecandidate = (e) => {
+                if (e.candidate && socket) {
+                    socket.emit("meeting:ice", {
+                        roomId,
+                        to: id,
+                        candidate: e.candidate,
+                    });
+                }
+            };
+
+            // negotiationneeded → funnel through single-flight negotiator
+            pc.onnegotiationneeded = () => {
+                st.needNegotiation = true;
+                negotiate(id, pc, st);
+            };
+
+            // Optional: auto ICE-restart if connection failed (keeps it resilient)
+            pc.addEventListener("connectionstatechange", async () => {
+                if (pc.connectionState === "failed") {
+                    console.warn("[webrtc] connection failed → ICE restart");
+                    try {
+                        const offer = await pc.createOffer({
+                            iceRestart: true,
+                        });
+                        await pc.setLocalDescription(offer);
+                        socket.emit("meeting:offer", {
+                            roomId,
+                            to: id,
+                            sdp: pc.localDescription,
+                        });
+                    } catch (e) {
+                        console.warn("[webrtc] ICE restart error:", e);
+                    }
                 }
             });
-        }
 
-        // remote media
-        pc.ontrack = (e) => {
-            const incoming = e.streams[0];
-            const p = peersRef.current.get(id);
-            if (p) {
-                p.stream = incoming;
-                refresh();
-            }
-        };
-
-        // ICE → signal to the other peer
-        pc.onicecandidate = (e) => {
-            if (e.candidate && socket) {
-                socket.emit("meeting:ice", { roomId, to: id, candidate: e.candidate });
-            }
-        };
-
-        // negotiationneeded → funnel through single-flight negotiator
-        pc.onnegotiationneeded = () => {
-            st.needNegotiation = true;
-            negotiate(id, pc, st);
-        };
-
-        // Optional: auto ICE-restart if connection failed (keeps it resilient)
-        pc.addEventListener("connectionstatechange", async () => {
-            if (pc.connectionState === "failed") {
-                console.warn("[webrtc] connection failed → ICE restart");
-                try {
-                    const offer = await pc.createOffer({ iceRestart: true });
-                    await pc.setLocalDescription(offer);
-                    socket.emit("meeting:offer", { roomId, to: id, sdp: pc.localDescription });
-                } catch (e) {
-                    console.warn("[webrtc] ICE restart error:", e);
-                }
-            }
-        });
-
-        const peer = { id, pc, stream: null, state: st };
-        peersRef.current.set(id, peer);
-        refresh();
-        return peer;
-    }, [iceServers, roomId, socket, negotiate]);
+            const peer = { id, pc, stream: null, state: st };
+            peersRef.current.set(id, peer);
+            refresh();
+            return peer;
+        },
+        [iceServers, roomId, socket, negotiate]
+    );
 
     const leaveAll = useCallback(() => {
-        peersRef.current.forEach((p) => { try { p.pc.close(); } catch { } });
+        peersRef.current.forEach((p) => {
+            try {
+                p.pc.close();
+            } catch {}
+        });
         peersRef.current.clear();
         refresh();
         if (socket && roomId) socket.emit("meeting:leave", { roomId });
@@ -198,7 +237,8 @@ export default function useWebRTC(socket, roomId) {
             const readyForOffer =
                 !st.makingOffer &&
                 (pc.signalingState === "stable" ||
-                    (pc.signalingState === "have-local-offer" && st.isSettingRemoteAnswerPending));
+                    (pc.signalingState === "have-local-offer" &&
+                        st.isSettingRemoteAnswerPending));
 
             const offerCollision = !readyForOffer;
             st.ignoreOffer = !st.polite && offerCollision;
@@ -224,7 +264,11 @@ export default function useWebRTC(socket, roomId) {
                 if (pc.signalingState !== "have-remote-offer") return;
 
                 await pc.setLocalDescription(answer);
-                socket.emit("meeting:answer", { roomId, to: from, sdp: pc.localDescription });
+                socket.emit("meeting:answer", {
+                    roomId,
+                    to: from,
+                    sdp: pc.localDescription,
+                });
             } catch (e) {
                 console.warn("[offer] error", e, "state=", pc.signalingState);
             }
@@ -265,7 +309,9 @@ export default function useWebRTC(socket, roomId) {
         const onUserLeft = ({ userId }) => {
             const peer = peersRef.current.get(userId);
             if (peer) {
-                try { peer.pc.close(); } catch { }
+                try {
+                    peer.pc.close();
+                } catch {}
                 peersRef.current.delete(userId);
                 refresh();
             }
@@ -277,7 +323,9 @@ export default function useWebRTC(socket, roomId) {
             for (const id of peersRef.current.keys()) {
                 if (!want.has(id)) {
                     const p = peersRef.current.get(id);
-                    try { p.pc.close(); } catch { }
+                    try {
+                        p.pc.close();
+                    } catch {}
                     peersRef.current.delete(id);
                 }
             }
