@@ -8,6 +8,7 @@ export default function useLocalMedia() {
 
     const startLocal = useCallback(async (constraints = { audio: true, video: true }) => {
         const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        console.log("Local stream tracks:", stream.getTracks());
         setLocalStream(stream);
         tracksRef.current.audio = stream.getAudioTracks()[0] || null;
         tracksRef.current.video = stream.getVideoTracks()[0] || null;
