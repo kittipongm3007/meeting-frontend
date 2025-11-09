@@ -1,11 +1,13 @@
 // src/pages/RoomPage.jsx
-import React from "react";
+import React, { useEffect, useState, useRef, useCallback } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import useSocket from "../hooks/useSocket.js";
 import useLocalMedia from "../hooks/useLocalMedia.js";
 import useWebRTC from "../hooks/useWebRTC.js";
 import VideoTile from "../components/meeting/VideoTile.jsx";
 import MeetingControls from "../components/meeting/MeetingControls.jsx";
+import { useStt } from "../hooks/useStt.js";
+import { useSentence } from "../hooks/useSentence.js";
 
 const PEER_ID_KEY = "meeting.peerId";
 function getPeerIdPerTab() {
@@ -20,7 +22,52 @@ const shortId = (id) => (id ? id.slice(0, 6) : "");
 
 export default function RoomPage() {
     const { roomId } = useParams();
+    const [translated, setTranslated] = useState("");
+    const clearTimerRef = useRef(null);
+
     const nav = useNavigate();
+    const {
+        supported,
+        listening,
+        transcript,
+        interim,
+        error,
+        start,
+        stop,
+        reset,
+    } = useStt({
+        lang: "th-TH",
+        autoRestart: true,
+    });
+    console.log("transcript", transcript);
+    console.log("supported", supported);
+    console.log("listening", listening);
+
+    const handleAppend = useCallback((chunk) => {
+        // ต่อท้าย subtitle เดิม
+        setTranslated((prev) => (prev + chunk).trim());
+
+        // ถ้ามี timer เก่าอยู่ ให้เคลียร์ก่อน
+        if (clearTimerRef.current) {
+            clearTimeout(clearTimerRef.current);
+        }
+
+        // ตั้งเวลาให้เคลียร์ subtitle หลัง 3 วินาที (เปลี่ยนได้)
+        clearTimerRef.current = setTimeout(() => {
+            setTranslated("");
+        }, 3000); // 3000ms = 3 วินาที
+    }, []);
+
+    useEffect(() => {
+        start();
+    }, []);
+
+    useSentence({
+        liveSource: (transcript + " " + interim).trim(),
+        sttLocale: "th-TH", // หรืออ่านจาก stt.lang ถ้าเก็บไว้
+        targetLang: "ja", // อยากแปลเป็นอะไร
+        onAppend: handleAppend,
+    });
 
     const socket = useSocket(import.meta.env.VITE_WS_URL);
     const {
@@ -101,7 +148,6 @@ export default function RoomPage() {
     return (
         <div>
             <h2>Room: {roomId}</h2>
-
             <div
                 style={{
                     display: "flex",
@@ -127,7 +173,6 @@ export default function RoomPage() {
                     ({shortId(peerIdRef.current)})
                 </span>
             </div>
-
             <div
                 style={{
                     display: "grid",
@@ -136,7 +181,17 @@ export default function RoomPage() {
                     gap: 12,
                 }}
             >
-               
+                {console.log("localStream =", localStream)}
+                {console.log(
+                    "peers =",
+                    Array.from(peers.values()).map((p) => ({
+                        id: p.id,
+                        hasStream: !!p.stream,
+                        tracks: p.stream
+                            ? p.stream.getTracks().map((t) => t.kind)
+                            : [],
+                    }))
+                )}
                 <VideoTile
                     stream={localStream}
                     muted
@@ -150,7 +205,6 @@ export default function RoomPage() {
                     />
                 ))}
             </div>
-
             <MeetingControls
                 hasAudio={hasAudio}
                 hasVideo={hasVideo}
@@ -164,7 +218,7 @@ export default function RoomPage() {
                 }}
                 onLeave={leaveRoom}
             />
-
+            {translated}
             {!joined && <p>กำลังเข้าร่วม...</p>}
         </div>
     );
